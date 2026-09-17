@@ -43,17 +43,41 @@ def _split_query(query: str) -> tuple[str, str | None]:
     return query.strip(), None
 
 
-def _with_lowercase(fc, fields: list[str]):
-    """Return `fc` with a case-insensitive '<field>_lower' copy of each field
-    in `fields` — ee.Filter.stringContains is case-sensitive, and admin
-    boundary datasets aren't consistently cased."""
-    import ee
+def _case_variants(text: str) -> list[str]:
+    """A handful of plausible casings to try. ee.Filter.stringContains is
+    case-sensitive and admin-boundary datasets aren't consistently cased, but
+    normalizing case by transforming the whole collection (.map() over every
+    feature before filtering) is what made lookups slow — WDPA alone has
+    ~280,000 features, and a per-feature map() blocks Earth Engine's filter
+    pushdown/indexing. ORing a few literal-cased filters together stays cheap
+    and lets EE optimize normally.
+    """
+    candidates = [text, text.title(), text.upper(), text.lower()]
+    return list(dict.fromkeys(c for c in candidates if c))
 
-    def _add(feature):
-        updates = {f"{name}_lower": ee.String(feature.get(name)).toLowerCase() for name in fields}
-        return feature.set(updates)
 
-    return fc.map(_add)
+# Common abbreviations that never literally appear inside these datasets' full
+# country names (GAUL spells it 'United States of America', so a context of
+# 'USA' would otherwise never match via substring) — expanded into an extra
+# search term alongside the literal casings above.
+_COUNTRY_ALIASES = {
+    "usa": "United States of America",
+    "us": "United States of America",
+    "u.s.": "United States of America",
+    "u.s.a.": "United States of America",
+    "uk": "United Kingdom",
+    "uae": "United Arab Emirates",
+    "drc": "Democratic Republic of the Congo",
+    "car": "Central African Republic",
+}
+
+
+def _context_terms(context: str) -> list[str]:
+    terms = _case_variants(context)
+    alias = _COUNTRY_ALIASES.get(context.strip().lower())
+    if alias:
+        terms += _case_variants(alias)
+    return list(dict.fromkeys(terms))
 
 
 _MAX_INLINE_REGION_CHARS = 2000  # a plain rectangle easily fits; a real polygon won't
@@ -77,13 +101,15 @@ def resolve_region(query: str, max_results: int = 3) -> str:
     description (name, country/state, kind, bounding box in degrees) — pass
     that region_id to any tool that takes `region`.
 
-    Matching is case-insensitive. Many place names repeat worldwide (there are
-    dozens of towns named 'San Francisco' across Latin America and the
-    Philippines, for instance) — if a plain name returns the wrong country, or
-    might, disambiguate with 'Place, Context', e.g. 'San Francisco, USA' or
+    Matching tries a few common casings (Title Case, UPPER, lower) rather than
+    requiring exact case. Many place names repeat worldwide (there are dozens
+    of towns named 'San Francisco' across Latin America and the Philippines,
+    for instance) — if a plain name returns the wrong country, or might,
+    disambiguate with 'Place, Context', e.g. 'San Francisco, USA' or
     'San Francisco, California'; the context is matched against the state/
-    country the place is in. Always check the country/state on a hit before
-    trusting it for a well-known place with a common name.
+    country the place is in (common abbreviations like 'USA'/'UK' are
+    recognized). Always check the country/state on a hit before trusting it
+    for a well-known place with a common name.
 
     Searches, in order: districts/counties, states/provinces, countries (FAO
     GAUL), and protected areas (WDPA).
@@ -97,22 +123,21 @@ def resolve_region(query: str, max_results: int = 3) -> str:
     import ee
 
     place, context = _split_query(query)
-    place_lower = place.lower()
-    context_lower = context.lower() if context else None
+    place_terms = _case_variants(place)
 
     hits: list[str] = []
     for name_field, asset_id, kind, context_fields in _SOURCES:
         if len(hits) >= max_results:
             break
 
-        fc = _with_lowercase(ee.FeatureCollection(asset_id), [name_field, *context_fields])
-        row_filter = ee.Filter.stringContains(f"{name_field}_lower", place_lower)
-        if context_lower and context_fields:
+        row_filter = ee.Filter.Or(*[ee.Filter.stringContains(name_field, t) for t in place_terms])
+        if context and context_fields:
+            context_terms = _context_terms(context)
             row_filter = ee.Filter.And(row_filter, ee.Filter.Or(*[
-                ee.Filter.stringContains(f"{cf}_lower", context_lower) for cf in context_fields
+                ee.Filter.stringContains(cf, t) for cf in context_fields for t in context_terms
             ]))
 
-        matches = fc.filter(row_filter)
+        matches = ee.FeatureCollection(asset_id).filter(row_filter)
         limit = max_results - len(hits)
         try:
             n = matches.limit(limit).size().getInfo()

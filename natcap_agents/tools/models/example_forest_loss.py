@@ -20,6 +20,7 @@ from smolagents import tool
 from ... import results
 from ...regions import region_geometry
 from ...safety import ensure_ee
+from ..mapping import publish_layer
 
 _HANSEN_ASSET = "UMD/hansen/global_forest_change_2023_v1_11"
 
@@ -47,21 +48,24 @@ def example_forest_loss(region: str, region_label: str = "region", min_tree_cove
 
     gfc = ee.Image(_HANSEN_ASSET)
     is_forest = gfc.select("treecover2000").gte(min_tree_cover)
-    loss = gfc.select("lossyear").gt(0).And(is_forest)
+    loss = gfc.select("lossyear").gt(0).And(is_forest).rename("forest_loss")
 
     try:
         area_m2 = loss.multiply(ee.Image.pixelArea()).reduceRegion(
             reducer=ee.Reducer.sum(), geometry=geom, scale=30, maxPixels=1e10, bestEffort=True,
-        ).get("lossyear")
+        ).get("forest_loss")
         loss_ha = ee.Number(area_m2).divide(10_000).getInfo()
     except Exception as e:  # noqa: BLE001
         return f"Computation failed: {type(e).__name__}: {e}"
 
-    vis = {"bands": ["lossyear"], "min": 1, "max": 23, "palette": ["yellow", "orange", "red"]}
-    tile_url = loss.selfMask().getMapId(vis)["tile_fetcher"].url_format
-
+    # `loss` is a 0/1 mask (did this pixel lose forest, yes/no) — a single
+    # highlight color, not a min..max gradient (there's nothing in between).
     board = results.current()
-    board.add_layer(name=f"{region_label}: forest loss", tile_url=tile_url)
+    publish_layer(
+        board, name=f"{region_label}: forest loss", image=loss.selfMask(), band="forest_loss",
+        palette=["orangered"], vis_min=0, vis_max=1,
+        label="Forest loss (Hansen GFC)",
+    )
     board.add_stat(
         label=region_label, model="example_forest_loss", metric="tree_cover_loss_ha",
         value=round(loss_ha, 1),

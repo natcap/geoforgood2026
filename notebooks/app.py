@@ -131,6 +131,7 @@ def _(crew, mo, prompt, results, run_button, setup_error):
 
 @app.cell
 def _(board, mo):
+    import branca.colormap as _cm
     import folium
 
     _BASEMAP_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -144,16 +145,43 @@ def _(board, mo):
     if board.layers:
         folium.LayerControl().add_to(_m)
 
+    # One legend per distinct vis (skip duplicates — e.g. the same model run
+    # twice for a year-over-year comparison shares one legend, not two).
+    _seen_legends = set()
+    for _layer in board.layers:
+        _legend = _layer.legend
+        if _legend is None:
+            continue
+        _key = (_legend.label, _legend.min, _legend.max, tuple(_legend.palette))
+        if _key in _seen_legends:
+            continue
+        _seen_legends.add(_key)
+        _caption = f"{_legend.label} ({_legend.unit})" if _legend.unit else _legend.label
+        _cm.LinearColormap(
+            colors=_legend.palette, vmin=_legend.min, vmax=_legend.max, caption=_caption,
+        ).add_to(_m)
+
     mo.Html(f'<div style="height:100%;width:100%;overflow:hidden">{_m._repr_html_()}</div>')
     return
 
 
 @app.cell
 def _(board, mo):
+    # board.rows is the flat one-metric-per-row table every model tool feeds;
+    # board.tables holds any additional named summary tables a tool chooses to
+    # publish (results.Board.add_table) — both render here, stacked, in a
+    # scrollable area so neither is cut off regardless of row count.
+    _blocks = []
     if board.rows:
-        mo.ui.table(board.rows, label="Stats", selection=None)
+        _blocks.append(mo.ui.table(board.rows, label="Stats", selection=None))
     else:
-        mo.md("_No stats yet — run a prompt that calls a model/compute tool._")
+        _blocks.append(mo.md("_No stats yet — run a prompt that calls a model/compute tool._"))
+
+    for _name, _rows in board.tables.items():
+        _blocks.append(mo.md(f"**{_name}**"))
+        _blocks.append(mo.ui.table(_rows, selection=None))
+
+    mo.vstack(_blocks)
     return
 
 

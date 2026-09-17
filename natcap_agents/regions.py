@@ -21,13 +21,40 @@ from .safety import ensure_ee
 _COUNTER = itertools.count(1)
 _REGISTRY: dict[str, object] = {}  # region_id -> ee.Geometry
 
-# (name property, EE asset id, human label), searched in this order.
+# (name property, EE asset id, human label, [context fields checked out to
+# country/state]), searched in this order. Context fields let a query like
+# 'San Francisco, USA' disambiguate a common place name (there are dozens of
+# San Franciscos across Latin America and the Philippines) by also requiring
+# a country/state match, not just the place name.
 _SOURCES = [
-    ("ADM2_NAME", "FAO/GAUL/2015/level2", "district/county"),
-    ("ADM1_NAME", "FAO/GAUL/2015/level1", "state/province"),
-    ("ADM0_NAME", "FAO/GAUL/2015/level0", "country"),
-    ("NAME", "WCMC/WDPA/current/polygons", "protected area"),
+    ("ADM2_NAME", "FAO/GAUL/2015/level2", "district/county", ["ADM1_NAME", "ADM0_NAME"]),
+    ("ADM1_NAME", "FAO/GAUL/2015/level1", "state/province", ["ADM0_NAME"]),
+    ("ADM0_NAME", "FAO/GAUL/2015/level0", "country", []),
+    ("NAME", "WCMC/WDPA/current/polygons", "protected area", []),
 ]
+
+
+def _split_query(query: str) -> tuple[str, str | None]:
+    """Split 'Place, Context' (e.g. 'San Francisco, California') into (place,
+    context); returns (query, None) if there's no comma."""
+    if "," in query:
+        place, _, context = query.partition(",")
+        return place.strip(), context.strip() or None
+    return query.strip(), None
+
+
+def _with_lowercase(fc, fields: list[str]):
+    """Return `fc` with a case-insensitive '<field>_lower' copy of each field
+    in `fields` — ee.Filter.stringContains is case-sensitive, and admin
+    boundary datasets aren't consistently cased."""
+    import ee
+
+    def _add(feature):
+        updates = {f"{name}_lower": ee.String(feature.get(name)).toLowerCase() for name in fields}
+        return feature.set(updates)
+
+    return fc.map(_add)
+
 
 _MAX_INLINE_REGION_CHARS = 2000  # a plain rectangle easily fits; a real polygon won't
 
@@ -47,46 +74,74 @@ def resolve_region(query: str, max_results: int = 3) -> str:
     """Look up a place name and register its boundary server-side, WITHOUT
     returning the polygon itself (a country/park boundary can be thousands of
     vertices). Returns one short region_id per match plus a compact
-    description (name, kind, bounding box in degrees) — pass that region_id to
-    any tool that takes `region`.
+    description (name, country/state, kind, bounding box in degrees) — pass
+    that region_id to any tool that takes `region`.
+
+    Matching is case-insensitive. Many place names repeat worldwide (there are
+    dozens of towns named 'San Francisco' across Latin America and the
+    Philippines, for instance) — if a plain name returns the wrong country, or
+    might, disambiguate with 'Place, Context', e.g. 'San Francisco, USA' or
+    'San Francisco, California'; the context is matched against the state/
+    country the place is in. Always check the country/state on a hit before
+    trusting it for a well-known place with a common name.
 
     Searches, in order: districts/counties, states/provinces, countries (FAO
     GAUL), and protected areas (WDPA).
 
     Args:
-        query: Place name to search for, e.g. 'Yosemite' or 'Kenya' or 'Amazonas'.
+        query: Place name to search for, optionally 'Place, Context' to
+            disambiguate, e.g. 'Yosemite', 'Kenya', or 'San Francisco, USA'.
         max_results: Max number of matches to return (default 3).
     """
     ensure_ee()
     import ee
 
+    place, context = _split_query(query)
+    place_lower = place.lower()
+    context_lower = context.lower() if context else None
+
     hits: list[str] = []
-    for name_field, asset_id, kind in _SOURCES:
+    for name_field, asset_id, kind, context_fields in _SOURCES:
         if len(hits) >= max_results:
             break
-        fc = ee.FeatureCollection(asset_id)
-        matches = fc.filter(ee.Filter.stringContains(name_field, query))
+
+        fc = _with_lowercase(ee.FeatureCollection(asset_id), [name_field, *context_fields])
+        row_filter = ee.Filter.stringContains(f"{name_field}_lower", place_lower)
+        if context_lower and context_fields:
+            row_filter = ee.Filter.And(row_filter, ee.Filter.Or(*[
+                ee.Filter.stringContains(f"{cf}_lower", context_lower) for cf in context_fields
+            ]))
+
+        matches = fc.filter(row_filter)
+        limit = max_results - len(hits)
         try:
-            n = matches.limit(max_results - len(hits)).size().getInfo()
+            n = matches.limit(limit).size().getInfo()
         except Exception:  # noqa: BLE001
             continue
         if not n:
             continue
-        feats = matches.limit(max_results - len(hits)).toList(max_results - len(hits)).getInfo()
+        feats = matches.limit(limit).toList(limit).getInfo()
         for f in feats:
-            name = (f.get("properties") or {}).get(name_field, query)
+            props = f.get("properties") or {}
+            name = props.get(name_field, place)
+            where = " / ".join(props[cf] for cf in reversed(context_fields) if props.get(cf))
             geom = ee.Feature(f).geometry()
             region_id = f"R{next(_COUNTER)}"
             _REGISTRY[region_id] = geom
             bbox = _bbox_deg(geom)
-            hits.append(f"- region_id={region_id}  name={name}  kind={kind}  bbox_deg={bbox}")
+            label = f"{name}, {where}" if where else name
+            hits.append(f"- region_id={region_id}  name={label}  kind={kind}  bbox_deg={bbox}")
 
     if not hits:
-        return (
-            f"No match for '{query}' in districts/states/countries/protected areas. "
-            "Try a different spelling or a broader/narrower name, or pass a bounding box "
-            "'west,south,east,north' (degrees) directly as `region` instead."
+        msg = f"No match for '{query}' in districts/states/countries/protected areas."
+        if context:
+            msg += f" (searched for '{place}' with context '{context}')"
+        msg += (
+            " Try a different spelling or a broader/narrower name, add a country/state for "
+            "disambiguation ('Place, Context'), or pass a bounding box 'west,south,east,north' "
+            "(degrees) directly as `region` instead."
         )
+        return msg
     return "\n".join(hits)
 
 

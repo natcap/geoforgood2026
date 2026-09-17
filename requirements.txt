@@ -8,6 +8,7 @@ google-genai>=1.0.0
 earthengine-api>=1.7.0
 geemap>=0.35.0
 folium>=0.17.0
+numpy>=1.26.0  # used directly by scripts/urban_nature_access.py
 
 # Env + reactive notebook
 python-dotenv>=1.0.0

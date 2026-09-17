@@ -4,8 +4,8 @@ The model itself (InvestUrbanCoolingModel) lives in scripts/urban_cooling.py —
 this file only adapts it to the tool contract: resolve `region` via
 regions.region_geometry (never a raw polygon), supply real Earth Engine input
 layers for the region — Dynamic World land cover composited for the EXACT
-analysis window (see _dynamic_world_lulc below) plus TerraClimate reference
-ET, and MODIS LST for the rural reference temperature / UHI magnitude (see
+analysis window (see ../dynamic_world.py) plus TerraClimate reference ET, and
+MODIS LST for the rural reference temperature / UHI magnitude (see
 _reference_climate) — run the model, and publish a map layer + stats rows to
 the results board.
 
@@ -24,6 +24,9 @@ from smolagents import tool
 from ... import results
 from ...regions import region_geometry
 from ...safety import ensure_ee
+from ..dynamic_world import URBAN_CODE as _DW_URBAN_CODE
+from ..dynamic_world import composite_lulc as _dynamic_world_lulc
+from ..mapping import publish_layer
 
 # scripts/ lives at the repo root, one level up from natcap_agents/ — add it to
 # sys.path so the model's own module (owned/edited independently under
@@ -51,51 +54,41 @@ _DYNAMIC_WORLD_BIOPHYSICAL_TABLE = {
     7: {"kc": 0.1, "green_area": 0, "shade": 0.0, "albedo": 0.30, "building_intensity": 0.0},  # bare
     8: {"kc": 0.1, "green_area": 0, "shade": 0.0, "albedo": 0.80, "building_intensity": 0.0},  # snow_and_ice
 }
-_DYNAMIC_WORLD_URBAN_CODE = 6  # built
-_DYNAMIC_WORLD_RURAL_CODES = [0, 1, 2, 3, 4, 5, 7, 8]  # everything but built
 
-_DYNAMIC_WORLD_ASSET = "GOOGLE/DYNAMICWORLD/V1"
 _TERRACLIMATE_ASSET = "IDAHO_EPSCOR/TERRACLIMATE"
 _MODIS_LST_ASSET = "MODIS/061/MOD11A1"
 _MODIS_LST_SCALE = 1000  # native resolution (m) of MOD11A1
-_DYNAMIC_WORLD_SCALE = 10  # native resolution (m) of Dynamic World
 
+# MODIS daytime LST is masked out over open water (and unreliable over
+# flooded_vegetation/snow), so "rural = everything but built" — fine for the
+# general urban/rural split elsewhere — silently starves the reference
+# temperature of valid pixels in a water-heavy region (a coastal or bay-side
+# AOI). Use only classes MODIS LST actually retrieves over.
+_LST_LAND_CODES = [1, 2, 4, 5, 7]  # trees, grass, crops, shrub_and_scrub, bare
 
-def _dynamic_world_lulc(aoi, start_date: str, end_date: str):
-    """Composite Dynamic World's discrete land-cover class ('label' band) over
-    [start_date, end_date] for `aoi`, as the per-pixel majority (mode) class
-    across that window's Sentinel-2 scenes.
-
-    Returns the composite ee.Image, or None if there are no Dynamic World
-    scenes covering this region/window (e.g. a very short or very old date
-    range).
-    """
-    import ee
-
-    col = (
-        ee.ImageCollection(_DYNAMIC_WORLD_ASSET)
-        .filterBounds(aoi)
-        .filterDate(start_date, end_date)
-        .select("label")
-    )
-    if col.size().getInfo() == 0:
-        return None
-    return col.mode().rename("label")
+# If the first rural ring (radius = rural_buffer_km) has no valid land pixels
+# — plausible when the surrounding area is also mostly water — widen it
+# before giving up.
+_RURAL_BUFFER_RETRY_MULTIPLIERS = (1, 2, 4)
 
 
 def _reference_climate(aoi, lulc, start_date: str, end_date: str, rural_buffer_m: float):
     """Derive (t_ref, uhi_max) from MODIS land-surface temperature — no web
-    search, no user-supplied guess. t_ref is the mean LST over vegetated/rural
-    Dynamic World pixels in a ring buffered outward from `aoi` (the
-    surrounding countryside, not the urban area itself); uhi_max is how much
-    hotter the hottest built-up pixel inside `aoi` is than that rural
-    reference.
+    search, no user-supplied guess. t_ref is the mean LST over well-observed
+    land pixels (trees/grass/crops/shrub/bare — not water, which MODIS LST
+    doesn't retrieve over) in a ring buffered outward from `aoi` (the
+    surrounding countryside); uhi_max is how much hotter the hottest built-up
+    pixel inside `aoi` is than that rural reference (or, if `aoi` has no
+    built-up pixels at all, the hottest well-observed land pixel in `aoi`).
 
-    Returns (t_ref, uhi_max) as plain floats, or (None, None) if the window/
-    region has no usable MODIS LST or land-cover pixels (e.g. a cloudy period
-    or a region with no rural surroundings to reference against).
+    Returns (t_ref, uhi_max, notes) as (float, float, list[str]), or
+    (None, None, notes) if no usable MODIS LST / land-cover pixels were found
+    even after widening the search ring. `notes` records any fallback taken,
+    for the caller to surface to the user.
     """
     import ee
+
+    notes: list[str] = []
 
     lst_c = (
         ee.ImageCollection(_MODIS_LST_ASSET)
@@ -107,27 +100,51 @@ def _reference_climate(aoi, lulc, start_date: str, end_date: str, rural_buffer_m
         .rename("lst_c")
     )
 
-    rural_mask = lulc.remap(_DYNAMIC_WORLD_RURAL_CODES, [1] * len(_DYNAMIC_WORLD_RURAL_CODES), 0)
-    urban_mask = lulc.eq(_DYNAMIC_WORLD_URBAN_CODE)
+    land_mask = lulc.remap(_LST_LAND_CODES, [1] * len(_LST_LAND_CODES), 0)
+    built_mask = lulc.eq(_DW_URBAN_CODE)
+    lst_land = lst_c.updateMask(land_mask)
 
-    rural_ring = aoi.buffer(rural_buffer_m).difference(aoi, ee.ErrorMargin(1))
-
-    scalars = ee.Dictionary({
-        "t_ref": lst_c.updateMask(rural_mask).reduceRegion(
+    t_ref = None
+    for multiplier in _RURAL_BUFFER_RETRY_MULTIPLIERS:
+        rural_ring = aoi.buffer(rural_buffer_m * multiplier).difference(aoi, ee.ErrorMargin(1))
+        t_ref = lst_land.reduceRegion(
             reducer=ee.Reducer.mean(), geometry=rural_ring, scale=_MODIS_LST_SCALE,
             maxPixels=1e9, bestEffort=True,
-        ).get("lst_c"),
-        "t_urban_max": lst_c.updateMask(urban_mask).reduceRegion(
+        ).get("lst_c").getInfo()
+        if t_ref is not None:
+            if multiplier != 1:
+                notes.append(
+                    f"widened the rural search ring to {multiplier}x rural_buffer_km to find "
+                    "enough land (this area's surroundings are water-heavy)"
+                )
+            break
+
+    if t_ref is None:
+        return None, None, notes
+
+    t_urban_max = lst_c.updateMask(built_mask).reduceRegion(
+        reducer=ee.Reducer.max(), geometry=aoi, scale=_MODIS_LST_SCALE,
+        maxPixels=1e9, bestEffort=True,
+    ).get("lst_c").getInfo()
+
+    if t_urban_max is None:
+        # No built-up pixels in the AOI (e.g. it's mostly water with little or
+        # no urban footprint) — fall back to the hottest well-observed land
+        # pixel there instead of failing outright.
+        t_urban_max = lst_land.reduceRegion(
             reducer=ee.Reducer.max(), geometry=aoi, scale=_MODIS_LST_SCALE,
             maxPixels=1e9, bestEffort=True,
-        ).get("lst_c"),
-    }).getInfo()
+        ).get("lst_c").getInfo()
+        if t_urban_max is not None:
+            notes.append(
+                "no built-up pixels found in the region; used its hottest land pixel instead "
+                "of a true urban/built reference for uhi_max"
+            )
 
-    t_ref = scalars.get("t_ref")
-    t_urban_max = scalars.get("t_urban_max")
-    if t_ref is None or t_urban_max is None:
-        return None, None
-    return t_ref, t_urban_max - t_ref
+    if t_urban_max is None:
+        return None, None, notes
+
+    return t_ref, t_urban_max - t_ref, notes
 
 
 @tool
@@ -184,12 +201,16 @@ def urban_cooling(
             f"{eto_start_date}..{eto_end_date} — try a wider date range."
         )
 
-    t_ref, uhi_max = _reference_climate(aoi, lulc, eto_start_date, eto_end_date, rural_buffer_km * 1000)
+    t_ref, uhi_max, climate_notes = _reference_climate(
+        aoi, lulc, eto_start_date, eto_end_date, rural_buffer_km * 1000,
+    )
     if t_ref is None:
         return (
             f"Could not derive a rural reference temperature for {region_label} in "
-            f"{eto_start_date}..{eto_end_date} (no usable MODIS LST / land-cover pixels — "
-            "try a wider rural_buffer_km, a different date range, or check the region)."
+            f"{eto_start_date}..{eto_end_date} — no usable MODIS land-surface-temperature "
+            "pixels even after widening the rural search ring (common for a region that's "
+            "mostly water). Try a much larger rural_buffer_km, a different date range, or "
+            "check the region."
         )
 
     ref_eto = (
@@ -225,11 +246,12 @@ def urban_cooling(
     if mean_hmi is None or mean_t_air is None:
         return f"Computation returned no data for {region_label} — region may not overlap the input layers."
 
-    vis = {"bands": ["hmi"], "min": 0, "max": 1, "palette": ["blue", "yellow", "red"]}
-    tile_url = out.select("hmi").getMapId(vis)["tile_fetcher"].url_format
-
     board = results.current()
-    board.add_layer(name=f"{region_label}: heat mitigation index", tile_url=tile_url)
+    publish_layer(
+        board, name=f"{region_label}: heat mitigation index", image=out, band="hmi",
+        palette=["blue", "yellow", "red"], vis_min=0, vis_max=1,
+        label="Heat mitigation index",
+    )
     board.add_stat(
         label=region_label, model="urban_cooling", metric="mean_heat_mitigation_index",
         value=round(mean_hmi, 3),
@@ -239,9 +261,11 @@ def urban_cooling(
         value=round(mean_t_air, 2),
     )
 
+    notes_suffix = f" NOTE: {'; '.join(climate_notes)}." if climate_notes else ""
     return (
         f"Urban cooling in {region_label}: mean heat mitigation index = {mean_hmi:.3f}, "
         f"mean air temperature = {mean_t_air:.2f} degC "
         f"(t_ref={t_ref:.1f} degC, uhi_max={uhi_max:.1f} degC from MODIS LST; "
         f"InVEST Urban Cooling, Dynamic World + TerraClimate {eto_start_date}..{eto_end_date})."
+        f"{notes_suffix}"
     )

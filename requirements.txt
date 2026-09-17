@@ -1,0 +1,20 @@
+# Agents
+smolagents>=1.26.0
+
+# Gemini via Google's SDK (Vertex API key, Vertex service account, or Gemini API)
+google-genai>=1.0.0
+
+# Earth Engine + maps
+earthengine-api>=1.7.0
+geemap>=0.35.0
+folium>=0.17.0
+
+# Env + reactive notebook
+python-dotenv>=1.0.0
+marimo>=0.9.0
+pandas>=2.0.0
+
+# Web search + page fetch (example researcher agent)
+ddgs>=9.0.0
+markdownify>=0.13.0
+requests>=2.31.0

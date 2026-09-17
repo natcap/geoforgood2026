@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+secrets/*
+!secrets/.gitkeep
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Generated tools (optional: comment out to version participant-built tools)
+# natcap_agents/tools/generated/
+
+# Outputs
+outputs/
+
+# Downloaded/cached catalog data
+.cache/
+
+# marimo's local session cache
+notebooks/__marimo__/

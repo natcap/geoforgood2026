@@ -145,12 +145,23 @@ def resolve_region(query: str, max_results: int = 3) -> str:
             continue
         if not n:
             continue
-        feats = matches.limit(limit).toList(limit).getInfo()
-        for f in feats:
-            props = f.get("properties") or {}
+
+        # Pull only the small stuff (a few short name properties) via .getInfo();
+        # the geometry itself STAYS a lazy server-side reference the whole time —
+        # never round-tripped through client-side JSON. A real admin boundary
+        # (e.g. a county's actual coastline) can be a large, complex multi-part
+        # polygon; reconstructing that from serialized GeoJSON risks a subtly
+        # different geometry (winding/precision) that then fails to intersect
+        # anything downstream — exactly the "no data in this region" symptom,
+        # for a region whose data plainly exists.
+        feature_list = matches.limit(limit).toList(limit)
+        prop_names = [name_field, *context_fields]
+        for i in range(n):
+            feature = ee.Feature(feature_list.get(i))
+            props = ee.Dictionary({p: feature.get(p) for p in prop_names}).getInfo()
             name = props.get(name_field, place)
             where = " / ".join(props[cf] for cf in reversed(context_fields) if props.get(cf))
-            geom = ee.Feature(f).geometry()
+            geom = feature.geometry()  # still lazy — resolved only when a model tool uses it
             region_id = f"R{next(_COUNTER)}"
             _REGISTRY[region_id] = geom
             bbox = _bbox_deg(geom)

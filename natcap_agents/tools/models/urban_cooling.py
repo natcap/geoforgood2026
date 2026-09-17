@@ -26,7 +26,7 @@ from ...regions import region_geometry
 from ...safety import ensure_ee
 from ..dynamic_world import URBAN_CODE as _DW_URBAN_CODE
 from ..dynamic_world import composite_lulc as _dynamic_world_lulc
-from ..mapping import publish_layer
+from ..mapping import local_utm_crs, publish_layer
 
 # scripts/ lives at the repo root, one level up from natcap_agents/ — add it to
 # sys.path so the model's own module (owned/edited independently under
@@ -194,7 +194,14 @@ def urban_cooling(
     except ValueError as e:
         return str(e)
 
-    lulc = _dynamic_world_lulc(aoi, eto_start_date, eto_end_date)
+    # `crs` fixes the composite to a local metric grid (aoi's own UTM zone) at
+    # exactly `scale` metres/pixel — required before the InVEST model builds
+    # and convolves its own decay kernels over it. Without this, a reducer
+    # composite has no defined native projection, so the kernels' real-world
+    # size would depend on whatever resolution a given request implies (e.g.
+    # the current map zoom level for interactive tile rendering) instead of
+    # staying fixed. See mapping.local_utm_crs.
+    lulc = _dynamic_world_lulc(aoi, eto_start_date, eto_end_date, scale=scale, crs=local_utm_crs(aoi))
     if lulc is None:
         return (
             f"No Dynamic World land-cover scenes found for {region_label} in "

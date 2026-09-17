@@ -26,7 +26,7 @@ from ... import results
 from ...regions import region_geometry
 from ...safety import ensure_ee
 from ..dynamic_world import composite_lulc
-from ..mapping import percentile_range, publish_layer
+from ..mapping import local_utm_crs, percentile_range, publish_layer
 
 # scripts/ lives at the repo root, one level up from natcap_agents/ — add it to
 # sys.path so the model's own module (owned/edited independently under
@@ -80,8 +80,32 @@ def _population_image_for_year(aoi, requested_year: int):
         return None, None
 
     use_year = max(int(min_year), min(requested_year, int(max_year)))
-    image = col.filter(ee.Filter.calendarRange(use_year, use_year, "year")).first()
+    # This collection is ONE IMAGE PER COUNTRY PER YEAR (its own STAC schema
+    # lists 'country' as a per-image property) — not a single global mosaic.
+    # `.first()` grabs an arbitrary one of however many country-tiles overlap
+    # `aoi`, which silently produces a partly- or entirely-masked image for
+    # any region straddling (or near) a tile boundary — e.g. Singapore, which
+    # sits right against Malaysia's/Indonesia's tiles, or a large country like
+    # the US that may itself be split across multiple tiles. `.mosaic()`
+    # combines every matching tile into one seamless image instead.
+    image = col.filter(ee.Filter.calendarRange(use_year, use_year, "year")).mosaic()
     return image, use_year
+
+
+def _mask_coverage(image, band: str, aoi, scale: float) -> float | None:
+    """Fraction (0-1) of `aoi` where `band` has a valid (non-masked) pixel.
+    `.mask()` is itself always fully defined (0 or 1, never masked), so its
+    mean over the region is exactly the valid-data fraction — a cheap way to
+    tell whether a "no data"/patchy result is a real gap in the source data
+    (e.g. persistent cloud/fog leaving Dynamic World unclassified for the
+    whole date window) rather than a bug in this tool.
+    """
+    import ee
+
+    frac = image.select(band).mask().reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=aoi, scale=scale, maxPixels=1e9, bestEffort=True,
+    ).get(band).getInfo()
+    return frac
 
 
 @tool
@@ -134,7 +158,16 @@ def urban_nature_access(
     except ValueError as e:
         return str(e)
 
-    lulc = composite_lulc(aoi, start_date, end_date)
+    # `crs` fixes both inputs to the SAME local metric grid (aoi's own UTM
+    # zone) at exactly `scale` metres/pixel — required before the model
+    # convolves its search-radius kernel over them. Without this, a reducer
+    # composite like `lulc` has no defined native projection, so the kernel's
+    # real-world size would depend on whatever resolution a given request
+    # implies (e.g. the current map zoom level for interactive tile
+    # rendering) instead of staying fixed. See mapping.local_utm_crs.
+    crs = local_utm_crs(aoi)
+
+    lulc = composite_lulc(aoi, start_date, end_date, scale=scale, crs=crs)
     if lulc is None:
         return (
             f"No Dynamic World land-cover scenes found for {region_label} in "
@@ -148,10 +181,17 @@ def urban_nature_access(
     year_note = f" (WorldPop has no {requested_year} data; used nearest available year {used_year})" \
         if used_year != requested_year else ""
 
+    # Deliberately NOT clipped to `aoi` here: the model convolves this with a
+    # search_radius_m kernel, and clipping before a neighbourhood operation
+    # starves it of real neighbouring population data near the region's own
+    # boundary (there's nothing there to sum/average once you've cut it off,
+    # so pixels within roughly one kernel radius of the edge can come out
+    # wrong or masked). The model itself already clips the final combined
+    # result to `aoi` at the end, which is the right place for it.
     pop_resampled = (
-        worldpop.select("population").clip(aoi)
+        worldpop.select("population")
         .resample("bilinear")
-        .reproject(crs=lulc.projection(), scale=scale)
+        .reproject(crs=crs, scale=scale)
         .divide((100.0 / scale) ** 2)
     )
 
@@ -179,6 +219,42 @@ def urban_nature_access(
     pct_undersupplied = summary.get("pct_population_undersupplied")
     if population is None or supply_per_capita is None:
         return f"Computation returned no data for {region_label} — region may not overlap the input layers."
+
+    # If the map shows big gaps within the region, find out WHERE they come
+    # from rather than leaving it a mystery. Three checks, in order of how far
+    # through the pipeline they are: Dynamic World's own classification
+    # (input), the model's own `population` band — which is pop.unmask(0), so
+    # it SHOULD be ~100% regardless of anything else — and the final
+    # `supply_per_capita` band the map actually shows. If population is fine
+    # but supply_per_capita isn't, the gap isn't missing input data at all —
+    # it's introduced by the model's own convolution math (scripts/
+    # urban_nature_access.py convolves a population image that was clipped to
+    # the AOI *before* convolving it, so the kernel runs out of real
+    # neighbours near the region's own edge — a classic clip-before-
+    # neighbourhood-op ordering issue).
+    coverage_note = ""
+    try:
+        supply_coverage = _mask_coverage(out, "supply_per_capita", aoi, scale)
+        if supply_coverage is not None and supply_coverage < 0.9:
+            lulc_coverage = _mask_coverage(lulc, "label", aoi, scale)
+            pop_coverage = _mask_coverage(out, "population", aoi, scale)
+            lulc_pct = f"{lulc_coverage * 100:.0f}%" if lulc_coverage is not None else "unknown"
+            pop_pct = f"{pop_coverage * 100:.0f}%" if pop_coverage is not None else "unknown"
+            if pop_coverage is not None and pop_coverage > 0.95 and (lulc_coverage is None or lulc_coverage > 0.95):
+                cause = (
+                    "both inputs have near-full coverage there, so the gap is coming from the "
+                    "model's own convolution, not missing data — most likely the population "
+                    "image being clipped to the region before it's convolved, starving the "
+                    "kernel of real neighbours near the region's edge"
+                )
+            else:
+                cause = "usually means persistent cloud/fog left those input pixels unclassified for this date range"
+            coverage_note = (
+                f" NOTE: only {supply_coverage * 100:.0f}% of {region_label} has valid data "
+                f"(input coverage there — Dynamic World: {lulc_pct}, population: {pop_pct}) — {cause}."
+            )
+    except Exception:  # noqa: BLE001
+        pass  # diagnostic only — never let this block the main result
 
     # supply_per_capita has no natural upper bound (it can run far above the
     # demand target in leafy areas), so a fixed max clips most of the region
@@ -215,4 +291,5 @@ def urban_nature_access(
         f"mean supply = {supply_per_capita:.1f} m^2/person (target {demand_per_capita_m2:.0f} m^2/person), "
         f"{pct_undersupplied:.1f}% of population undersupplied "
         f"(InVEST Urban Nature Access / 2SFCA, Dynamic World + WorldPop)."
+        f"{coverage_note}"
     )

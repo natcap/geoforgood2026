@@ -12,6 +12,29 @@ from __future__ import annotations
 from typing import Any
 
 
+def local_utm_crs(aoi) -> str:
+    """The EPSG code of the UTM zone containing `aoi`'s centroid — a genuine
+    local metric projection, unlike a global default (e.g. Web Mercator,
+    whose apparent ground size per pixel grows with latitude) or an
+    undefined one (an ImageCollection reducer's output has no native
+    projection at all). Use this to `.reproject(crs=..., scale=...)` any
+    image BEFORE convolving a fixed-pixel kernel over it: without an explicit
+    reproject, Earth Engine evaluates the image at whatever resolution a
+    given request implies (e.g. the current map zoom level for interactive
+    tile rendering), so a kernel meant to cover a fixed real-world distance
+    ends up covering a different one depending on how it's viewed — this is
+    what "the pattern changes as you zoom in" looks like. InVEST itself
+    always runs on one fixed-resolution projected raster grid; this matches
+    that.
+    """
+    import ee
+
+    lon, lat = ee.Geometry(aoi).centroid(1).coordinates().getInfo()
+    zone = int((lon + 180) // 6) + 1
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return f"EPSG:{epsg}"
+
+
 def percentile_range(
     image, band: str, aoi, scale: float, low: float = 2, high: float = 98,
     fallback: tuple[float, float] = (0.0, 1.0),

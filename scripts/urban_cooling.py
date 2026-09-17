@@ -1,12 +1,68 @@
 """
 InVEST Urban Cooling Model - Google Earth Engine (Python API)
 ============================================================
-Translates the Natural Capital Project's InVEST Urban Cooling Model into
-Google Earth Engine for scalable cloud-based urban microclimate modeling.
 
 References:
 - InVEST User Guide: https://storage.googleapis.com/releases.naturalcapitalproject.org/invest-userguide/latest/en/urban_cooling_model.html
 - Bosch et al. (2021) / Hamel et al. (2024), GMD.
+
+
+Data Needs
+----------
+workspace directory (workspace directory, required): The folder where all the model’s output files will be written. If this folder does not exist, it will be created. If data already exists in the folder, it will be overwritten.
+
+file suffix (text, optional): Suffix that will be appended to all output file names. Useful to differentiate between model runs.
+
+land use/land cover (raster, units: unitless, required): Map of LULC for the area of interest. All values in this raster must have corresponding entries in the Biophysical Table.  The model will use the resolution and projection of this layer to resample and reproject all outputs. The resolution should be small enough to capture the effect of green spaces in the landscape, although LULC categories can comprise a mix of vegetated and non-vegetated covers (e.g. “residential”, which may have 30% canopy cover).
+
+biophysical table (CSV, required): A table mapping each LULC code to biophysical data for that LULC class. All values in the LULC raster must have corresponding entries in this table.
+
+Columns:
+  * lucode (integer, required): LULC codes from the LULC raster. Each code must be a unique integer.
+  * kc (number, units: unitless, required): Crop coefficient for this LULC class.
+  * green_area (true/false): Enter 1 to indicate that the LULC is considered a green area. Enter 0 to indicate that the LULC is not considered a green area.  Green areas larger than 2 hectares have an additional cooling effect.
+  * shade (ratio, conditionally required): The proportion of area in this LULC class that is covered by tree canopy at least 2 meters high. Required if the ‘factors’ option is selected for the Cooling Capacity Calculation Method.
+  * albedo (ratio, conditionally required): The proportion of solar radiation that is directly reflected by this LULC class. Required if the ‘factors’ option is selected for the Cooling Capacity Calculation Method.
+  * building_intensity (ratio, conditionally required): The ratio of building floor area to footprint area, with all values in this column normalized between 0 and 1. Required if the ‘intensity’ option is selected for the Cooling Capacity Calculation Method.
+
+reference evapotranspiration (raster, units: mm, required): Map of reference evapotranspiration values.  These values can be for a specific date or monthly values can be used as a proxy.
+
+area of interest (vector, polygon/multipolygon, required): A map of areas over which to aggregate and summarize the final results.  The AOI(s) will typically be city or neighborhood boundaries.
+
+maximum cooling distance (number, units: m, required): Distance over which green areas larger than 2 hectares have a cooling effect.  This is 𝑑𝑐⁢𝑜⁢𝑜⁢𝑙 in equation (118). Recommended value: 450 m.
+
+reference air temperature (number, units: °C, required): Air temperature in a rural reference area where the urban heat island effect is not observed. This is 𝑇𝑎⁢𝑖⁢𝑟,𝑟⁢𝑒⁢𝑓 in equation (120). This could be nighttime or daytime temperature, for a specific date or an average over several days. The results will be given for the same period of interest.
+
+UHI effect (number, units: °C, required): The magnitude of the urban heat island effect, i.e., the difference between the rural reference temperature and the maximum temperature observed in the city. This model is designed for cases where UHI is positive, meaning the urban air temperature is greater than the rural reference temperature. This is 𝑈⁢𝐻⁡𝐼𝑚𝑎𝑥 in equation (120).
+
+air blending distance (number, units: m, required): Radius over which to average air temperatures to account for air mixing. Recommended value range for initial run: 500 m to 600 m; see Schatz et al. 2014 and Lonsdorf et al. 2021.
+
+cooling capacity calculation method (option, required): The air temperature predictor method to use. Values must be one of the following text strings:
+  * ”factors”: Use the weighted shade, albedo, and ETI factors as a temperature predictor (for daytime temperatures).
+  * ”intensity”: Use building intensity as a temperature predictor (for nighttime temperatures).
+
+buildings (vector, polygon/multipolygon, conditionally required): A map of built infrastructure footprints. Required if Run Energy Savings Valuation is selected.
+Fields needed in the buildings vector:
+  * type (integer, required): Code indicating the building type. These codes must match those in the Energy Consumption Table.
+
+run energy savings valuation (true/false): Run the energy savings valuation model.
+
+run work productivity valuation (true/false): Run the work productivity valuation model.
+
+energy consumption table (CSV, conditionally required): A table of energy consumption data for each building type. Required if Run Energy Savings Valuation is selected.
+Columns in the energy conservation table:
+  * type (integer, required): Building type codes matching those in the Buildings vector.
+  * consumption (number, units: kWh/(m² · °C), required): Energy consumption by footprint area for this building type.  Note: The consumption value is per unit of footprint area, not floor area. This value must be adjusted for the average number of stories for structures of this type.
+  * cost (number, units: currency units/kWh, optional): The cost of electricity for this building type. If this column is provided, the energy savings outputs will be in the this currency unit rather than kWh.  The values in this column are very likely to be the same for all building types.
+
+average relative humidity (percent, conditionally required): The average relative humidity over the time period of interest. Required if Run Work Productivity Valuation is selected.
+
+shade weight (ratio, optional): The relative weight to apply to shade when calculating the cooling capacity index. If not provided, defaults to 0.6.
+
+albedo weight (ratio, optional): The relative weight to apply to albedo when calculating the cooling capacity index. If not provided, defaults to 0.2.
+
+evapotranspiration weight (ratio, optional): The relative weight to apply to ETI when calculating the cooling capacity index. If not provided, defaults to 0.2.
+
 """
 
 import math

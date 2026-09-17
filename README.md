@@ -60,25 +60,47 @@ marimo run notebooks/app.py
 ```
 
 You need a GCP project with the **Vertex AI** and **Earth Engine** APIs
-enabled, the project **registered for Earth Engine**, and a service account
-with `roles/earthengine.writer` + `roles/serviceusage.serviceUsageConsumer`
-(add `roles/aiplatform.user` only if the models use the service account).
+enabled and the project **registered for Earth Engine**. Whoever authenticates
+— a service account or your own user account — needs
+`roles/earthengine.writer` + `roles/serviceusage.serviceUsageConsumer` (add
+`roles/aiplatform.user` only if the models use that same identity).
+
+### Earth Engine auth (`.env`)
+
+Two credentials work, and `init_earth_engine()` picks between them by looking
+at what is actually on disk:
+
+- `GOOGLE_APPLICATION_CREDENTIALS` names a key file **that exists** → that
+  service-account key (paired with `EE_SERVICE_ACCOUNT`).
+- otherwise → **Application Default Credentials**. On a laptop, run once:
+  ```bash
+  gcloud auth application-default login --project $GCP_PROJECT_ID
+  ```
+  On a GCE VM / Cloud Run / Colab there is nothing to run — the attached
+  service account already *is* the ADC, so leave both `.env` lines blank.
+
+A key path that points at a missing file does not raise: the variable is
+dropped (a stale one makes google-auth fail instead of falling back to ADC)
+and ADC is used, with the path mentioned if initialization then fails.
+`ee.Authenticate()` is never called — it opens a browser and would hang a
+headless run.
 
 ### Model auth (`.env`)
 
-Earth Engine always uses the service account. The models use, in order:
+The models use, in order:
 
 - `VERTEX_API_KEY` set → Vertex **Express mode** with that key (no service
   account needed for the models).
 - else `LLM_BACKEND=gemini` + `GEMINI_API_KEY` → Gemini Developer API.
-- else → Vertex via the **service account** (`GOOGLE_APPLICATION_CREDENTIALS`).
+- else → Vertex via the same credential Earth Engine uses (service-account key
+  if present, otherwise ADC).
 
 ### Layout
 
 ```
 natcap_agents/
   config.py       # .env -> Settings
-  auth.py         # bootstrap(): init EE + build the Gemini model
+  auth.py         # bootstrap(): init EE (SA key or ADC) + build the Gemini model
   models.py       # VertexAIServerModel (google-genai; Vertex key / SA / Gemini API)
   safety.py       # authorized imports for the code-executing orchestrator
   results.py      # shared board: model tools publish layers/stats here

@@ -1,12 +1,20 @@
-"""Single place that turns one GCP service-account key into working
-Earth Engine *and* Vertex Gemini access.
+"""Single place that turns one GCP credential into working Earth Engine
+*and* Vertex Gemini access.
 
-Design goal: one credential, zero interactive prompts. The same key file
-authorizes both services, so a single bootstrap() call gets everything working.
+Design goal: one credential, zero interactive prompts. Two credentials work
+here, and the same one authorizes both services:
+
+  * a **service-account key** file (GOOGLE_APPLICATION_CREDENTIALS), or
+  * **Application Default Credentials** — `gcloud auth application-default
+    login` on a laptop, or the attached service account on GCE / Cloud Run /
+    Colab, where there is no key file to ship.
+
+Whichever is present, a single bootstrap() call gets everything working.
 """
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import ee
 
@@ -15,47 +23,94 @@ from .models import VertexAIServerModel
 
 _EE_INITIALIZED = False
 
+# Where `gcloud auth application-default login` writes user credentials.
+_ADC_WELL_KNOWN = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
 
-def _export_service_account_creds(settings: Settings) -> None:
-    """Force GOOGLE_APPLICATION_CREDENTIALS to an ABSOLUTE path.
 
-    python-dotenv loads whatever is in .env verbatim (often a relative
-    './secrets/sa-key.json'), and google-auth resolves that against the process
-    working directory. We overwrite it with the absolute path so the key is
-    found from anywhere.
-    """
+def _key_file(settings: Settings) -> str | None:
+    """The service-account key's absolute path, or None if there isn't one on disk."""
     p = settings.credentials_abspath
-    if p:
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = p  # hard set, not setdefault
+    return p if p and os.path.exists(p) else None
+
+
+def _apply_gcp_credentials(settings: Settings) -> str:
+    """Point google-auth at whichever credential this machine actually has.
+
+    Returns "service_account" or "adc". Two environment quirks are handled:
+
+    * python-dotenv loads GOOGLE_APPLICATION_CREDENTIALS verbatim (often a
+      relative './secrets/sa-key.json') and google-auth resolves that against
+      the process working directory, so we rewrite it absolute.
+    * If .env still carries a key path but no key was ever dropped in, we
+      *remove* the variable. Left set, it makes google.auth.default() raise
+      "file was not found" instead of falling back to ADC.
+    """
+    key_path = _key_file(settings)
+    if key_path:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path  # hard set, not setdefault
+        return "service_account"
+
+    os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+    # User ADC carries no project of its own, and some Google APIs reject a
+    # call with no quota project attached. Ours is the one to bill.
+    os.environ.setdefault("GOOGLE_CLOUD_QUOTA_PROJECT", settings.project_id)
+    return "adc"
+
+
+def _adc_hint(settings: Settings, error: Exception) -> str:
+    """Explain an ADC failure in terms of the commands that fix it."""
+    lines = [
+        "Earth Engine could not initialize with Application Default Credentials "
+        f"for project '{settings.project_id}': {type(error).__name__}: {error}",
+    ]
+    configured = settings.credentials_abspath
+    if configured:
+        lines.append(
+            f"GOOGLE_APPLICATION_CREDENTIALS points at {configured}, which does "
+            "not exist, so ADC was used instead. Either drop the key file there "
+            "or clear that line in .env."
+        )
+    if not _ADC_WELL_KNOWN.exists():
+        lines.append(
+            "No ADC file found. Run once, in a terminal:\n"
+            f"  gcloud auth application-default login --project {settings.project_id}"
+        )
+    lines.append(
+        "The signed-in account also needs the project registered for Earth "
+        "Engine: https://code.earthengine.google.com/register"
+    )
+    return "\n".join(lines)
 
 
 def init_earth_engine(settings: Settings | None = None) -> None:
-    """Initialize the Earth Engine client with the service account.
+    """Initialize the Earth Engine client.
 
-    Falls back to Application Default Credentials (ADC) if no explicit
-    service-account email is configured but GOOGLE_APPLICATION_CREDENTIALS
-    points at a key file.
+    Uses the service-account key when one is configured and present on disk,
+    and Application Default Credentials otherwise. Never calls
+    ee.Authenticate(): it opens a browser and blocks, which would hang any
+    non-interactive caller.
     """
     global _EE_INITIALIZED
     if _EE_INITIALIZED:
         return
 
     settings = settings or load_settings()
-    _export_service_account_creds(settings)
-    key_path = settings.credentials_abspath
+    mode = _apply_gcp_credentials(settings)
 
-    if settings.ee_service_account and key_path:
-        if not os.path.exists(key_path):
-            raise FileNotFoundError(
-                f"Service-account key not found at {key_path}. "
-                "Check GOOGLE_APPLICATION_CREDENTIALS in your .env."
-            )
-        creds = ee.ServiceAccountCredentials(settings.ee_service_account, key_path)
+    if mode == "service_account" and settings.ee_service_account:
+        creds = ee.ServiceAccountCredentials(
+            settings.ee_service_account, _key_file(settings)
+        )
         ee.Initialize(creds, project=settings.project_id)
-    else:
-        # ADC path: works if GOOGLE_APPLICATION_CREDENTIALS is set or the
-        # environment is already GCP-authenticated (e.g. a VM).
+        _EE_INITIALIZED = True
+        return
+
+    # ADC, or a key file with no EE_SERVICE_ACCOUNT email set (google-auth
+    # reads the email straight out of the JSON in that case).
+    try:
         ee.Initialize(project=settings.project_id)
+    except Exception as error:  # noqa: BLE001 - re-raised with the fix attached
+        raise RuntimeError(_adc_hint(settings, error)) from error
 
     _EE_INITIALIZED = True
 
@@ -87,7 +142,7 @@ def make_model(model_id: str, settings: Settings | None = None, **kwargs) -> Ver
         return VertexAIServerModel(model_id, api_key=api_key, use_vertex=True, **kwargs)
 
     # Service-account / ADC path.
-    _export_service_account_creds(settings)  # absolute path so ADC finds the key
+    _apply_gcp_credentials(settings)  # key file if present, else ADC
     return VertexAIServerModel(
         model_id, project=settings.project_id, location=settings.vertex_location,
         use_vertex=True, **kwargs,

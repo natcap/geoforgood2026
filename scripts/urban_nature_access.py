@@ -1,4 +1,67 @@
-"""InVEST Urban Nature Access Model in Google Earth Engine (Python API)
+"""
+InVEST Urban Nature Access (UNA) Model - Python Google Earth Engine (GEE) Implementation
+======================================================================================
+
+MODEL DESCRIPTION (For AI Agents & Researchers)
+------------------------------------------------
+The InVEST Urban Nature Access (UNA) model evaluates the spatial distribution of 
+urban nature supply relative to human population demand. It calculates urban nature 
+availability across a continuous landscape using a modified Two-Step Floating 
+Catchment Area (2SFCA) methodology. 
+
+By modeling walking accessibility rather than simple straight-line buffers, it accounts 
+for competition among local residents for shared green spaces. This tool is critical 
+for evaluating environmental justice, green infrastructure equity, and urban planning policies.
+
+Methodological Steps:
+1. Nature Area Mapping (S_j): Identifies the urban nature supply value for each pixel 
+   by multiplying its area by a biophysical "nature proportion" mapped from LULC types.
+2. Step 1 (Supply-to-Population Ratio, R_j): Calculates population demand within a 
+   floating catchment (defined by `search_radius` d_0) around each nature pixel. 
+   Population count is weighted using a spatial distance-decay function (f(d)) to 
+   simulate decreasing travel probability. The raw nature area is divided by this 
+   weighted service-load to produce a localized provider-to-population ratio.
+3. Step 2 (Per-Capita Supply, A_i): Sums the distance-weighted R_j values of all 
+   accessible nature pixels within the catchment of each population pixel. This represents 
+   the true available green space (m² per person) allocated to a resident at that cell.
+4. Balance Analysis (Bal_i): Computes the difference between local per-capita supply (A_i) 
+   and a specified policy demand target (g_cap) to determine surplus or deficit.
+
+INPUTS DESCRIPTION
+------------------
+To run this model, the following inputs are consumed or generated:
+
+*   `aoi_bbox` (list of float):
+    Bounding box defined as [West, South, East, North] in decimal degrees. 
+    Defines the spatial boundary of the analysis.
+
+*   `search_radius` (float, meters):
+    The maximum catchment/walking distance (d_0). Represents the physical threshold 
+    residents are willing to travel to access nature (typically 300m - 1000m).
+
+*   `decay_type` (string):
+    The spatial impedance function modeling travel behavior over distance. Choices:
+    - 'dichotomy': Flat circular buffer (all pixels within d_0 contribute equally; weight = 1).
+    - 'exponential': Exponentially decreasing weight: weight = exp(-d / d_0).
+    - 'gaussian': Normal distribution with sigma = d_0 / 3: weight = exp(-0.5 * (d / sigma)^2).
+    - 'density': Epanechnikov-like kernel: weight = 0.75 * (1 - (d / d_0)^2).
+
+*   `demand_per_capita` (float, m² per person):
+    The target urban nature policy standard (g_cap). Represents the desired minimum 
+    green space allocated per resident (e.g., WHO guidelines recommend 9 - 30 m²/capita).
+
+*   `scale` (float, meters):
+    The output spatial resolution. Usually matches the finest input dataset (typically 
+    10m for ESA WorldCover or 30m for Landsat-based LULC).
+
+*   `lulc_nature_weights` (dict):
+    A biophysical dictionary mapping integer categorical land use/land cover codes 
+    to an urban nature fraction float [0.0 - 1.0]. A value of 1.0 represents entirely 
+    natural surface (e.g. dense forest) while 0.0 represents zero nature benefit (e.g. concrete).
+
+*   `population_image` (ee.Image):
+    A raster representing human population count per pixel. Typically sourced from 
+    WorldPop or GHSL, and resampled to match the LULC analysis scale.
 
 Provides a single function call interface to execute the model and retrieve
 results as Python dictionaries.
